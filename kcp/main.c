@@ -169,7 +169,6 @@ int main (int argc, char **argv) {
         snprintf(dst_, dst_len, "%s/%s", dst, dirname);
     }
 
-    struct io_uring ring;
     // TODO use iuqi_params to get interesting results should time permit
     if (io_uring_queue_init(UQ_DEPTH, &ring, 0) != 0) {
         perror(argv[0]);
