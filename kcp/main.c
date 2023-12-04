@@ -8,6 +8,13 @@
 #include <linux/io_uring.h>
 #include <liburing.h>
 #include <sys/mman.h>
+#include <assert.h> // bravo, great programming going on here!
+#include <unistd.h>
+#include <dirent.h>
+
+#ifndef BLOCK
+#define BLOCK 4096
+#endif
 
 #ifndef UQ_DEPTH
 #define UQ_DEPTH 256
@@ -23,6 +30,8 @@
 
 #define eprintf(...) fprintf (stderr, __VA_ARGS__)
 
+struct io_uring ring;
+
 void clear_trailing_slash (char *path) {
     int len = strlen(path);
     if (path[len - 2] == '/') {
@@ -37,6 +46,96 @@ char *get_dirname (char *path) {
     return ret;
 }
 
+int create_dir (char *path, mode_t mode) {
+    // oh fuck we need to maintain global io_uring state
+    // uhhh
+    // typo!!
+
+#ifdef USE_IO_URING
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    return sqe ? io_uring_prep_mkdir(sqe, dst, s_src.st_mode & 0777), 0 : 1;
+#else
+    // oh jeez forgot about permissions
+    // welp pass them in i guess
+    return mkdir(path, mode & 0777) != 0 ? errno : 0;
+    // u suck
+#endif
+    
+    // yknow... someone has to run these requests...
+    // fine, pass that flag to uring init
+    // this is extemely dangerous lmao lets just do it later
+    // get the preprocessor control flow cuffs on his ass!
+    // nooo i didnt do anything i was just trying to increase efficiency loll
+}
+
+// lame fstat wrapper
+mode_t get_mode (int fd) {
+    struct stat s;
+    assert(fstat(fd, &s) == 0);
+    return s.st_mode;
+}
+
+int copy (char *src, char *dst) {
+    int src_fd = open(src, O_RDONLY);
+    if (src_fd < 0) { return errno; }
+
+    int src_len = strlen(src); // critical
+    int dst_len = strlen(dst); // critical
+    
+    int err = 0;
+    if (err = create_dir(dst, get_mode(src_fd))) { return err; }
+
+    // cool now read the directory
+    // okay i am NOT using fdopendir or whatever here
+    // sounds like i need to use some syscall to read the dir aaaa
+    // well apparently uring doesnt like getdents!
+
+    // okay good news for u! uring doesnt handle directories, which means...
+    // this code is gonna get used after all! fdopendir time
+    DIR *src_dir = fdopendir(src_fd);
+    assert(src_dir);
+    for (struct dirent *dent = readdir(src_dir); dent; dent = readdir(src_dir)) {
+        if (dent->d_type == DT_REG || dent->d_type == DT_DIR) {
+            // is it hidden? if so ignore
+            if (dent->d_name[0] == '.') { continue; }
+            
+            // open it
+            int src_fpath_len = src_len + 2 + strlen(dent->d_name); // 2 bc slash, null
+            char *src_fpath = malloc(src_fpath_len);
+            snprintf(src_fpath, src_fpath_len, "%s/%s", src, dent->d_name);
+            
+            // TODO could rly use a helper for this!
+            // TODO need to remove a trailing slash here? idts right
+            int dst_fpath_len = dst_len + 2 + strlen(dent->d_name);
+            char *dst_fpath = malloc(dst_fpath_len);
+            snprintf(dst_fpath, dst_fpath_len, "%s/%s", dst, dent->d_name);
+
+            if (dent->d_type == DT_REG) {
+                int src_ffd = open(src_fpath, O_RDONLY);
+                if (src_ffd < 0) { return errno; }
+                
+                int dst_ffd = open(dst_fpath, O_WRONLY | O_CREAT, get_mode(src_ffd) & 0777);
+                if (dst_ffd < 0) { return errno; }
+                
+                // TODO uring lol
+                void *buf = malloc(BLOCK);
+                while (true) {
+                    int nread = read(src_ffd, buf, BLOCK);
+                    write(dst_ffd, buf, nread);
+                    if (nread < BLOCK) { break; }
+                }
+            } else {
+                // i assure u NO ONE CARES that u call strlen twice!!
+                err = copy(src_fpath, dst_fpath);
+                if (err) { return err; }
+            }
+            // uh okay now copy the data bruh
+        } // else ignore loll
+    }
+
+    return 0;
+}
+
 int main (int argc, char **argv) {
     if (argc != 3) {
         return 1;
@@ -46,7 +145,8 @@ int main (int argc, char **argv) {
     char *dst = argv[2];
     clear_trailing_slash(src);
     clear_trailing_slash(dst);
-    
+
+    // yes we call stat on src twice no please i dont want to care about it
     struct stat s_src;
     if (stat(src, &s_src) == 0) {
         if (!(s_src.st_mode & S_IFDIR)) {
@@ -64,69 +164,29 @@ int main (int argc, char **argv) {
         }
 
         char *dirname = get_dirname(src);
-        int dst_len = strlen(dst) + 1 + strlen(dirname);
+        int dst_len = strlen(dst) + 2 + strlen(dirname);
         char *dst_ = malloc(dst_len);
         snprintf(dst_, dst_len, "%s/%s", dst, dirname);
     }
 
-    // dst is the final path for the root directory
-    // dst 100% does not exist
-    // create it... with io_uring!
-
-    /*
-    if (mkdir(dst, s_src.st_mode & 0777)) {
-        perror(argv[0]);
-        return 1;
-    }
-    */
-    
-    // well before we can do that we have to setup
-    /*
-    struct io_uring_params sq_params = {
-        .sq_entries = SQ_DEPTH,
-        .cq_entries = CQ_DEPTH,
-        .flags = TODO,
-        .sq_thread_cpu = TODO,
-        .sq_thread_idle = TODO,
-        .features = TODO,
-        .wq_fd = TODO,
-        .resv = TODO,
-        .io_sqring_offsets = TODO,
-        .io_cqring_offsets = TODO
-    };
-    */
-
-    /*
-    struct io_uring_params uq_params;
-    bzero(&uq_params, sizeof(struct io_uring_params));
-    int uq_fd = io_uring_setup(UQ_DEPTH, &uq_params);
-    if (uq_fd < 0) {
-        eprintf("could not get uq_fd, retcode %d\n", uq_fd);
-        return 1;
-    }
-
-    int sq_sz = p.sq_off.array + p.sq_entries * sizeof(unsigned);
-    int cq_sz = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
-
-    void *sq_ptr = mmap(0, sq_sz, PROT_READ | PROT_WRITE, 
-                        MAP_SHARED | MAP_POPULATE,
-                        uq_fd, IORING_OFF_SQ_RING);
-    void *cq_ptr = mmap(0, cq_sz, PROT_READ | PROT_WRITE, 
-                        MAP_SHARED | MAP_POPULATE,
-                        uq_fd, IORING_OFF_CQ_RING);
-    
-    void *sq_ent = mmap(0, p.sq_entries * sizeof(struct io_uring_sqe),
-                        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
-                        s->ring_fd, IORING_OFF_SQES);
-    */
     struct io_uring ring;
     // TODO use iuqi_params to get interesting results should time permit
     if (io_uring_queue_init(UQ_DEPTH, &ring, 0) != 0) {
         perror(argv[0]);
         return 1;
     }
-    
-    struct io_uring_sqe *mk = io_uring_get_sqe(&ring);
-    io_uring_prep_mkdir(mk, dst, s_src.st_mode & 0777);
-    printf("%d requests completed\n", io_uring_submit_and_wait(&ring, 1));
+
+    // END SETUP
+
+#ifdef USE_IO_URING
+#else
+    // implement the whole damn thing in normal fucking syscalls!
+    // src exists, dst exists
+    // list the contents of src
+    // foreach regular file, copy it normal like [helper 0]
+    // foreach directory, recurse [helper -1 loll]
+    // create_dir should be a helper ig [helper 1 loll]
+#endif
+
+    return copy(src, dst);
 }
