@@ -12,24 +12,10 @@
 #include <unistd.h>
 #include <dirent.h>
 
-#ifndef BLOCK
-#define BLOCK 4096
-#endif
+#include "globals.h"
 
-#ifndef UQ_DEPTH
-#define UQ_DEPTH 256
-#endif
-
-#ifndef SQ_DEPTH
-#define SQ_DEPTH UQ_DEPTH
-#endif
-
-#ifndef CQ_DEPTH
-#define CQ_DEPTH UQ_DEPTH
-#endif
-
-#define eprintf(...) fprintf (stderr, __VA_ARGS__)
-
+void *bufs[UQ_DEPTH]; // one for each request
+int bufstats[UQ_DEPTH];
 struct io_uring ring;
 
 void clear_trailing_slash (char *path) {
@@ -118,12 +104,15 @@ int copy (char *src, char *dst) {
                 if (dst_ffd < 0) { return errno; }
                 
                 // TODO uring lol
+                /*
                 void *buf = malloc(BLOCK);
                 while (true) {
                     int nread = read(src_ffd, buf, BLOCK);
                     write(dst_ffd, buf, nread);
                     if (nread < BLOCK) { break; }
                 }
+                */
+                if (err = fcp_uring(src_ffd, dst_ffd)) { return err; }
             } else {
                 // i assure u NO ONE CARES that u call strlen twice!!
                 err = copy(src_fpath, dst_fpath);
@@ -187,5 +176,10 @@ int main (int argc, char **argv) {
     // create_dir should be a helper ig [helper 1 loll]
 #endif
 
+    void *bufbacker = mmap(0, BLOCK * UQ_DEPTH, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE | MAP_ANONYMOUS, 0, 0);
+    for (int i = 0; i < UQ_DEPTH; i++) {
+        bufs[i] = bufbacker + BLOCK*i;
+    }
+    
     return copy(src, dst);
 }
