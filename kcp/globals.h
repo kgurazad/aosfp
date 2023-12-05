@@ -1,6 +1,22 @@
 #ifndef _globals_h_
 #define _globals_h_
 
+#include <stdio.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+#include <strings.h>
+#include <stdlib.h>
+#include <linux/io_uring.h>
+#include <liburing.h>
+#include <sys/mman.h>
+#include <assert.h> // bravo, great programming going on here!
+#include <unistd.h>
+#include <dirent.h>
+#include <stdint.h>
+#include <stdbool.h>
+
 #ifndef BLOCK
 #define BLOCK 4096
 #endif

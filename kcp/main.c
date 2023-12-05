@@ -1,23 +1,131 @@
-#include <stdio.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <string.h>
-#include <strings.h>
-#include <stdlib.h>
-#include <linux/io_uring.h>
-#include <liburing.h>
-#include <sys/mman.h>
-#include <assert.h> // bravo, great programming going on here!
-#include <unistd.h>
-#include <dirent.h>
+// hi guys!
 
 #include "globals.h"
+
+typedef uint64_t req_n;
 
 void *bufs[UQ_DEPTH]; // one for each request
 int bufstats[UQ_DEPTH];
 struct io_uring ring;
+int submitted;
+int completed;
 
+struct req_t {
+    int fd;
+    int block;
+    int buf;
+    bool is_read;
+};
+
+req_n deflate_req (struct req_t *r) {
+    req_n ret = 0;
+    ret += r->fd;
+    ret = ret << 24;
+    ret += r->block;
+    ret = ret << 20;
+    ret += r->buf;
+    ret = ret << 1;
+    ret += r->is_read ? 1 : 0;
+    return ret;
+}
+
+void inflate_req (req_n n, struct req_t *r) {
+    r->is_read = n & 1;
+    n = n >> 1;
+    r->buf = n & 0xFFFFF;
+    n = n >> 20;
+    r->block = n & 0xFFFFFF;
+    n = n >> 24;
+    r->fd = n;
+}
+
+struct io_uring_sqe *get_sqe () {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    while (sqe == NULL) {
+        io_uring_submit(&ring);
+        handle_cq(true);
+        sqe = io_uring_get_sqe(&ring);
+    }
+    return sqe;
+}
+
+void submit_write (struct req_t *r, int sz) {
+    struct io_uring_sqe *sqe = get_sqe();
+    sqe->user_data = deflate_req(r);
+    io_uring_prep_write(sqe, r->fd, bufs[r->buf], sz, r->block * BLOCK);
+    submitted++;
+}
+
+void handle_cq (bool block) {
+    if (completed == submitted) { return; }
+
+    struct io_uring_cqe *cqe;
+    if (block) {
+        io_uring_wait_cqe(&ring, &cqe);
+    } else {
+        io_uring_peek_cqe(&ring, &cqe);
+    }
+
+    assert(cqe); // lol
+    completed++;
+    
+    struct req_t r;
+    inflate_req(cqe->user_data, &r);
+
+    if (r.is_read) {
+        int wsz = cqe->res;
+        io_uring_cqe_seen(&ring, cqe);
+        bufstats[r.buf] = KWRITE;
+        r.is_read = false;
+        submit_write(&r, wsz);
+    } else {
+        bufstats[r.buf] = KFREE;
+    }
+}
+
+int get_buf (int suggested) {
+    if (bufstats[suggested] == KFREE) {
+        return suggested;
+    }
+
+    if (suggested & 1) {
+        for (int i = UQ_DEPTH - 1; i >= 0; i--) {
+            if (bufstats[i] == KFREE) {
+                return i;
+            }
+        }
+    } else {
+        for (int i = 0; i < UQ_DEPTH; i++) {
+            if (bufstats[i] == KFREE) {
+                return i;
+            }
+        }
+    }
+
+    eprintf("i thought buffer accounting was supposed to work??\n");
+    assert(false);
+    return 1;
+}
+
+void submit_read (struct req_t *r) {
+    if (submitted - completed > UQ_DEPTH / 2) {
+        handle_cq(true);
+    }
+    
+    assert(r->is_read);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    if (r->buf == UQ_DEPTH) {
+        int bufid = get_buf(r->block);
+        while (bufid == UQ_DEPTH) {
+            handle_cq(true);
+        }
+        r->buf = bufid;
+    }
+    sqe->user_data = deflate_req(r);
+    bufstats[r->buf] = KREAD;
+    io_uring_prep_read(sqe, r->fd, bufs[r->buf], BLOCK, r->block * BLOCK);
+    submitted++;
+}
 void clear_trailing_slash (char *path) {
     int len = strlen(path);
     if (path[len - 2] == '/') {
@@ -61,37 +169,49 @@ mode_t get_mode (int fd) {
     return s.st_mode;
 }
 
+void fcp_uring2 (int sfd, int dfd) {
+    struct stat ssrc;
+    assert(fstat(sfd, &ssrc) == 0);
+    int len = ssrc.st_size;
+
+    int nreads = len / BLOCK;
+    if (len % BLOCK) { nreads++; }
+    
+    for (int i = 0; i < nreads; i++) {
+        struct req_t r = {
+            .fd = sfd,
+            .buf = UQ_DEPTH,
+            .block = i,
+            .is_read = true
+        };
+        submit_read(&r);
+    }
+
+    if (completed < submitted) {
+        io_uring_submit(&ring);
+    }
+}
+
 int copy (char *src, char *dst) {
     int src_fd = open(src, O_RDONLY);
     if (src_fd < 0) { return errno; }
 
-    int src_len = strlen(src); // critical
-    int dst_len = strlen(dst); // critical
+    int src_len = strlen(src);
+    int dst_len = strlen(dst);
     
     int err = 0;
     if (err = create_dir(dst, get_mode(src_fd))) { return err; }
 
-    // cool now read the directory
-    // okay i am NOT using fdopendir or whatever here
-    // sounds like i need to use some syscall to read the dir aaaa
-    // well apparently uring doesnt like getdents!
-
-    // okay good news for u! uring doesnt handle directories, which means...
-    // this code is gonna get used after all! fdopendir time
     DIR *src_dir = fdopendir(src_fd);
     assert(src_dir);
     for (struct dirent *dent = readdir(src_dir); dent; dent = readdir(src_dir)) {
         if (dent->d_type == DT_REG || dent->d_type == DT_DIR) {
-            // is it hidden? if so ignore
             if (dent->d_name[0] == '.') { continue; }
             
-            // open it
-            int src_fpath_len = src_len + 2 + strlen(dent->d_name); // 2 bc slash, null
+            int src_fpath_len = src_len + 2 + strlen(dent->d_name);
             char *src_fpath = malloc(src_fpath_len);
             snprintf(src_fpath, src_fpath_len, "%s/%s", src, dent->d_name);
             
-            // TODO could rly use a helper for this!
-            // TODO need to remove a trailing slash here? idts right
             int dst_fpath_len = dst_len + 2 + strlen(dent->d_name);
             char *dst_fpath = malloc(dst_fpath_len);
             snprintf(dst_fpath, dst_fpath_len, "%s/%s", dst, dent->d_name);
@@ -102,24 +222,17 @@ int copy (char *src, char *dst) {
                 
                 int dst_ffd = open(dst_fpath, O_WRONLY | O_CREAT, get_mode(src_ffd) & 0777);
                 if (dst_ffd < 0) { return errno; }
-                
-                // TODO uring lol
-                /*
-                void *buf = malloc(BLOCK);
-                while (true) {
-                    int nread = read(src_ffd, buf, BLOCK);
-                    write(dst_ffd, buf, nread);
-                    if (nread < BLOCK) { break; }
-                }
-                */
-                if (err = fcp_uring(src_ffd, dst_ffd)) { return err; }
+
+                fcp_uring2(src_ffd, dst_ffd);
             } else {
-                // i assure u NO ONE CARES that u call strlen twice!!
                 err = copy(src_fpath, dst_fpath);
                 if (err) { return err; }
             }
-            // uh okay now copy the data bruh
-        } // else ignore loll
+        }
+    }
+
+    if (completed < submitted) {
+        io_uring_submit(&ring);
     }
 
     return 0;
@@ -135,7 +248,6 @@ int main (int argc, char **argv) {
     clear_trailing_slash(src);
     clear_trailing_slash(dst);
 
-    // yes we call stat on src twice no please i dont want to care about it
     struct stat s_src;
     if (stat(src, &s_src) == 0) {
         if (!(s_src.st_mode & S_IFDIR)) {
@@ -166,20 +278,12 @@ int main (int argc, char **argv) {
 
     // END SETUP
 
-#ifdef USE_IO_URING
-#else
-    // implement the whole damn thing in normal fucking syscalls!
-    // src exists, dst exists
-    // list the contents of src
-    // foreach regular file, copy it normal like [helper 0]
-    // foreach directory, recurse [helper -1 loll]
-    // create_dir should be a helper ig [helper 1 loll]
-#endif
-
     void *bufbacker = mmap(0, BLOCK * UQ_DEPTH, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE | MAP_ANONYMOUS, 0, 0);
     for (int i = 0; i < UQ_DEPTH; i++) {
         bufs[i] = bufbacker + BLOCK*i;
     }
     
-    return copy(src, dst);
+    int err = copy(src, dst);
+    while (completed < submitted) { io_uring_submit(&ring); handle_cq(true); }
+    return err;
 }
