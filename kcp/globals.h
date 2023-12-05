@@ -35,6 +35,12 @@
 
 #define eprintf(...) fprintf (stderr, __VA_ARGS__)
 
+#ifdef VERBOSE
+#define DEBUG(...) printf (__VA_ARGS__)
+#else
+#define DEBUG(...)
+#endif
+
 #define KFREE 0
 #define KREAD 1
 #define KWRITE 2

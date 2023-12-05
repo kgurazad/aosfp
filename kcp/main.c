@@ -11,39 +11,47 @@ int submitted;
 int completed;
 
 struct req_t {
-    int fd;
+    int sfd;
+    int dfd;
     int block;
     int buf;
     bool is_read;
 };
 
 req_n deflate_req (struct req_t *r) {
+    assert(r->dfd - r->sfd == 1);
+    
     req_n ret = 0;
-    ret += r->fd;
+    ret += r->sfd;
     ret = ret << 24;
     ret += r->block;
     ret = ret << 20;
     ret += r->buf;
     ret = ret << 1;
     ret += r->is_read ? 1 : 0;
+
+    DEBUG("deflated req {%d/%d %d %d %d} to %lx\n", r->sfd, r->dfd, r->block, r->buf, r->is_read, ret);
     return ret;
 }
 
 void inflate_req (req_n n, struct req_t *r) {
+    req_n n_ = n;
     r->is_read = n & 1;
     n = n >> 1;
     r->buf = n & 0xFFFFF;
     n = n >> 20;
     r->block = n & 0xFFFFFF;
     n = n >> 24;
-    r->fd = n;
+    r->sfd = n;
+    r->dfd = n + 1;
+    DEBUG("inflated req {%d/%d %d %d %d} from %lx\n", r->sfd, r->dfd, r->block, r->buf, r->is_read, n_);
 }
 
 struct io_uring_sqe *get_sqe () {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     while (sqe == NULL) {
         io_uring_submit(&ring);
-        handle_cq(true);
+        handle_cq(false);
         sqe = io_uring_get_sqe(&ring);
     }
     return sqe;
@@ -51,34 +59,38 @@ struct io_uring_sqe *get_sqe () {
 
 void submit_write (struct req_t *r, int sz) {
     struct io_uring_sqe *sqe = get_sqe();
-    sqe->user_data = deflate_req(r);
-    io_uring_prep_write(sqe, r->fd, bufs[r->buf], sz, r->block * BLOCK);
+    io_uring_prep_write(sqe, r->dfd, bufs[r->buf], sz, r->block * BLOCK);
+    io_uring_sqe_set_data64(sqe, deflate_req(r));
+
     submitted++;
 }
 
 void handle_cq (bool block) {
+    DEBUG("handle cq ns %d nc %d\n", submitted, completed);
     if (completed == submitted) { return; }
 
     struct io_uring_cqe *cqe;
     if (block) {
         io_uring_wait_cqe(&ring, &cqe);
     } else {
-        io_uring_peek_cqe(&ring, &cqe);
+        int err = io_uring_peek_cqe(&ring, &cqe);
+        if (err) { return; }
     }
 
-    assert(cqe); // lol
     completed++;
-    
     struct req_t r;
     inflate_req(cqe->user_data, &r);
 
     if (r.is_read) {
         int wsz = cqe->res;
-        io_uring_cqe_seen(&ring, cqe);
+        io_uring_cqe_seen(&ring, cqe); // good one
+        DEBUG("write %d\n", r.buf);
         bufstats[r.buf] = KWRITE;
         r.is_read = false;
         submit_write(&r, wsz);
     } else {
+        io_uring_cqe_seen(&ring, cqe);
+        DEBUG("free %d\n", r.buf);
         bufstats[r.buf] = KFREE;
     }
 }
@@ -102,28 +114,38 @@ int get_buf (int suggested) {
         }
     }
 
+#ifdef STRICT_BUF
     eprintf("i thought buffer accounting was supposed to work??\n");
     assert(false);
-    return 1;
+#endif
+    return UQ_DEPTH;
 }
 
 void submit_read (struct req_t *r) {
+    DEBUG("submit read %08lx\n", r);
+    
     if (submitted - completed > UQ_DEPTH / 2) {
-        handle_cq(true);
+        handle_cq(false);
     }
     
     assert(r->is_read);
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    struct io_uring_sqe *sqe = get_sqe(); // good one
+    
     if (r->buf == UQ_DEPTH) {
-        int bufid = get_buf(r->block);
+        DEBUG("get buf\n");
+        int bufid = get_buf(r->block % UQ_DEPTH); // good one
         while (bufid == UQ_DEPTH) {
+            if (completed < submitted) { io_uring_submit(&ring); }
             handle_cq(true);
+            bufid = get_buf(r->block % UQ_DEPTH); // good one
         }
         r->buf = bufid;
+        DEBUG("got %d\n", bufid);
     }
-    sqe->user_data = deflate_req(r);
+    DEBUG("read %d\n", r->buf);
     bufstats[r->buf] = KREAD;
-    io_uring_prep_read(sqe, r->fd, bufs[r->buf], BLOCK, r->block * BLOCK);
+    io_uring_prep_read(sqe, r->sfd, bufs[r->buf], BLOCK, r->block * BLOCK);
+    sqe->user_data = deflate_req(r);
     submitted++;
 }
 void clear_trailing_slash (char *path) {
@@ -170,6 +192,8 @@ mode_t get_mode (int fd) {
 }
 
 void fcp_uring2 (int sfd, int dfd) {
+    DEBUG("fcp %d %d\n", sfd, dfd);
+    
     struct stat ssrc;
     assert(fstat(sfd, &ssrc) == 0);
     int len = ssrc.st_size;
@@ -179,7 +203,8 @@ void fcp_uring2 (int sfd, int dfd) {
     
     for (int i = 0; i < nreads; i++) {
         struct req_t r = {
-            .fd = sfd,
+            .sfd = sfd,
+            .dfd = dfd,
             .buf = UQ_DEPTH,
             .block = i,
             .is_read = true
@@ -192,7 +217,8 @@ void fcp_uring2 (int sfd, int dfd) {
     }
 }
 
-int copy (char *src, char *dst) {
+void copy (char *src, char *dst) {
+    DEBUG("copy %s %s\n", src, dst);
     int src_fd = open(src, O_RDONLY);
     if (src_fd < 0) { return errno; }
 
@@ -225,8 +251,7 @@ int copy (char *src, char *dst) {
 
                 fcp_uring2(src_ffd, dst_ffd);
             } else {
-                err = copy(src_fpath, dst_fpath);
-                if (err) { return err; }
+                copy(src_fpath, dst_fpath);
             }
         }
     }
@@ -235,7 +260,7 @@ int copy (char *src, char *dst) {
         io_uring_submit(&ring);
     }
 
-    return 0;
+    DEBUG("done copy %s %s\n", src, dst);
 }
 
 int main (int argc, char **argv) {
@@ -283,7 +308,7 @@ int main (int argc, char **argv) {
         bufs[i] = bufbacker + BLOCK*i;
     }
     
-    int err = copy(src, dst);
+    copy(src, dst);
     while (completed < submitted) { io_uring_submit(&ring); handle_cq(true); }
-    return err;
+    return 0;
 }
