@@ -197,7 +197,9 @@ void fcp_uring2 (int sfd, int dfd) {
     struct stat ssrc;
     assert(fstat(sfd, &ssrc) == 0);
     int len = ssrc.st_size;
-
+    fallocate(dfd, 0, 0, len);
+    // ignore errors, dont rly care if it fails since writes will rsz
+    
     int nreads = len / BLOCK;
     if (len % BLOCK) { nreads++; }
     

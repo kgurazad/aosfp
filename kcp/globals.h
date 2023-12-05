@@ -1,6 +1,8 @@
 #ifndef _globals_h_
 #define _globals_h_
 
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <sys/stat.h>
 #include <fcntl.h>
